@@ -1,0 +1,175 @@
+import os
+import requests
+from datetime import datetime, timedelta
+import pytz
+
+HUBSPOT_API_KEY = os.environ['HUBSPOT_API_KEY']
+SLACK_BOT_TOKEN = os.environ['SLACK_BOT_TOKEN']
+SLACK_CHANNEL = 'C0AK50VG5T3'
+HUBSPOT_PORTAL_ID = '5454671'
+
+ET = pytz.timezone('America/New_York')
+
+ADVISERS = [
+    {'name': 'Evan McMann', 'first': 'Evan', 'owner_id': '57373377', 'slack_id': 'U026H8VN5A8', 'field': 'existing_adviser_status', 'field_label': 'Existing Adviser Status'},
+    {'name': 'Connor Leavell', 'first': 'Connor', 'owner_id': '279223859', 'slack_id': 'U04DXSPDTE1', 'field': 'existing_adviser_status', 'field_label': 'Existing Adviser Status'},
+    {'name': 'Michael DelPozzo', 'first': 'Michael', 'owner_id': '35397207', 'slack_id': 'U026L2W9R9A', 'field': 'mmfc_outcome', 'field_label': 'MMFC Outcome'},
+    {'name': 'Michael Strang', 'first': 'Michael', 'owner_id': '109677699', 'slack_id': 'U02GR0UEHBK', 'field': 'mmfc_outcome', 'field_label': 'MMFC Outcome'},
+    {'name': 'Dan Bussiculo', 'first': 'Dan', 'owner_id': '93253442', 'slack_id': 'U0B89KH253J', 'field': 'existing_adviser_status', 'field_label': 'Existing Adviser Status'},
+]
+
+def get_target_date():
+    today = datetime.now(ET).date()
+    if today.weekday() == 0:
+        return today - timedelta(days=3)
+    return today - timedelta(days=1)
+
+def get_day_range_utc_ms(date):
+    start = ET.localize(datetime(date.year, date.month, date.day, 0, 0, 0))
+    end = ET.localize(datetime(date.year, date.month, date.day, 23, 59, 59, 999999))
+    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+
+def search_meetings(start_ms, end_ms):
+    url = 'https://api.hubapi.com/crm/v3/objects/meetings/search'
+    headers = {
+        'Authorization': f'Bearer {HUBSPOT_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+    filter_groups = [
+        {
+            'filters': [
+                {'propertyName': 'hs_meeting_start_time', 'operator': 'GTE', 'value': str(start_ms)},
+                {'propertyName': 'hs_meeting_start_time', 'operator': 'LTE', 'value': str(end_ms)},
+                {'propertyName': 'hubspot_owner_id', 'operator': 'EQ', 'value': a['owner_id']}
+            ]
+        }
+        for a in ADVISERS
+    ]
+    payload = {
+        'filterGroups': filter_groups,
+        'properties': ['hs_meeting_title', 'hs_meeting_start_time', 'hs_meeting_end_time', 'hubspot_owner_id'],
+        'limit': 100
+    }
+    response = requests.post(url, headers=headers, json=payload)
+    response.raise_for_status()
+    return response.json().get('results', [])
+
+def filter_meetings(meetings):
+    excluded = ['canceled', 'calendly:', 'mmfc stand up', 'existing advisers sync', 'mmfc/existing']
+    return [m for m in meetings if not any(kw in (m.get('properties', {}).get('hs_meeting_title', '') or '').lower() for kw in excluded)]
+
+def get_contacts_for_meeting(meeting_id, field):
+    url = f'https://api.hubapi.com/crm/v3/objects/meetings/{meeting_id}/associations/contacts'
+    headers = {'Authorization': f'Bearer {HUBSPOT_API_KEY}'}
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        return []
+    contact_ids = [r['id'] for r in response.json().get('results', [])]
+    if not contact_ids:
+        return []
+    url = 'https://api.hubapi.com/crm/v3/objects/contacts/batch/read'
+    payload = {
+        'inputs': [{'id': cid} for cid in contact_ids],
+        'properties': ['firstname', 'lastname'],
+        'propertiesWithHistory': [field]
+    }
+    response = requests.post(url, headers={**headers, 'Content-Type': 'application/json'}, json=payload)
+    if response.status_code != 200:
+        return []
+    return response.json().get('results', [])
+
+def was_updated_on_or_after(contact, field, target_date):
+    history = contact.get('propertiesWithHistory', {}).get(field, [])
+    for entry in history:
+        timestamp = entry.get('timestamp', '')
+        if timestamp:
+            try:
+                dt = datetime.strptime(timestamp, '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=pytz.utc)
+            except ValueError:
+                dt = datetime.strptime(timestamp, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=pytz.utc)
+            if dt.astimezone(ET).date() >= target_date:
+                return True
+    return False
+
+def parse_time(value):
+    if not value:
+        return 0
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        dt = datetime.strptime(value, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=pytz.utc)
+        return int(dt.timestamp() * 1000)
+
+def ms_to_et_time(ms):
+    return datetime.fromtimestamp(ms / 1000, tz=pytz.utc).astimezone(ET).strftime('%-I:%M %p')
+
+def send_slack_message(text):
+    url = 'https://slack.com/api/chat.postMessage'
+    headers = {'Authorization': f'Bearer {SLACK_BOT_TOKEN}', 'Content-Type': 'application/json'}
+    response = requests.post(url, headers=headers, json={'channel': SLACK_CHANNEL, 'text': text, 'mrkdwn': True})
+    response.raise_for_status()
+
+def build_message(adviser, meetings, contacts_by_meeting, target_date):
+    date_str = target_date.strftime('%B %-d, %Y')
+    name = adviser['name']
+    first = adviser['first']
+    slack_id = adviser['slack_id']
+    field = adviser['field']
+    field_label = adviser['field_label']
+
+    if not meetings:
+        return f"📋 *{field_label} Check — {name} — {date_str}* <@{slack_id}>\n\n📭 No meetings found for this date."
+
+    seen = set()
+    unique_contacts = []
+    contact_time = {}
+
+    for meeting in meetings:
+        start_ms = parse_time(meeting['properties'].get('hs_meeting_start_time'))
+        for contact in contacts_by_meeting.get(meeting['id'], []):
+            cid = contact['id']
+            if cid not in seen:
+                seen.add(cid)
+                unique_contacts.append(contact)
+                contact_time[cid] = start_ms
+
+    total = len(unique_contacts)
+    missing = [c for c in unique_contacts if not was_updated_on_or_after(c, field, target_date)]
+    updated = total - len(missing)
+
+    if not missing:
+        return f"📋 *{field_label} Check — {name} — {date_str}* <@{slack_id}>\n\n✅ All {total} contacts updated — great work, {first}!"
+
+    lines = [
+        f"📋 *{field_label} Check — {name} — {date_str}* <@{slack_id}>",
+        "",
+        f"*{total} contacts checked | {updated} ✅ updated | {len(missing)} ⚠️ missing*",
+        "",
+        "⚠️ *Missing updates:*"
+    ]
+
+    for contact in missing:
+        props = contact.get('properties', {})
+        name_str = f"{props.get('firstname', '')} {props.get('lastname', '')}".strip() or 'Unknown'
+        cid = contact['id']
+        time_str = ms_to_et_time(contact_time[cid]) if contact_time.get(cid) else 'Unknown time'
+        lines.append(f"• <https://app.hubspot.com/contacts/{HUBSPOT_PORTAL_ID}/contact/{cid}|{name_str}> — {time_str} ET")
+
+    lines += ["", f"Please update the {field_label} field for the contacts above."]
+    return "\n".join(lines)
+
+def main():
+    target_date = get_target_date()
+    print(f"Checking meetings for: {target_date}")
+    start_ms, end_ms = get_day_range_utc_ms(target_date)
+
+    all_meetings = filter_meetings(search_meetings(start_ms, end_ms))
+
+    for adviser in ADVISERS:
+        meetings = [m for m in all_meetings if m['properties'].get('hubspot_owner_id') == adviser['owner_id']]
+        contacts = {m['id']: get_contacts_for_meeting(m['id'], adviser['field']) for m in meetings}
+        send_slack_message(build_message(adviser, meetings, contacts, target_date))
+        print(f"Sent {adviser['first']}'s message")
+
+if __name__ == '__main__':
+    main()
